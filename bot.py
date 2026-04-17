@@ -83,12 +83,12 @@ def format_message(listing: dict, score: int) -> str:
         summary = summary[:297] + "…"
 
     lines = [
-        f"🎯 *{_escape_md(title)}*",
-        f"_{source}_ · score {score}" + (f" · {date}" if date else ""),
+        f"🎯 {title}",
+        f"{source} · score {score}" + (f" · {date}" if date else ""),
     ]
     if summary:
         lines.append("")
-        lines.append(_escape_md(summary))
+        lines.append(summary)
     if url:
         lines.append("")
         lines.append(url)
@@ -113,7 +113,6 @@ def send_telegram(message: str) -> bool:
             json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
-                "parse_mode": "MarkdownV2",
                 "disable_web_page_preview": False,
             },
             timeout=15,
