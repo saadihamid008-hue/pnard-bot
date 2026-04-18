@@ -1,8 +1,16 @@
-"""PNARD opportunity bot — runs hourly via GitHub Actions, posts new matches to Telegram."""
+"""PNARD opportunity bot — runs hourly via GitHub Actions, posts new matches to Telegram.
+
+Filters for:
+  1. A clear funding signal (call for proposals, EOI, RFP, consultancy, etc.)
+  2. Relevance to PNARD's lane (Pakistan agriculture, climate, gender, etc.)
+  3. Deadline not yet passed (based on dates parsed from the listing text)
+"""
 import json
 import os
+import re
 import sys
 import time
+from datetime import date
 from pathlib import Path
 
 import requests
@@ -14,30 +22,121 @@ from scrapers.worldbank import scrape_worldbank
 ROOT = Path(__file__).parent
 SEEN_FILE = ROOT / "seen.json"
 
-# Keywords that score a listing. Tuned for PNARD: regenerative ag in Pakistan,
-# climate adaptation, gender-in-ag, livestock, smallholders, consulting/tender.
-KEYWORDS = {
-    # core mission — high weight
-    "pakistan": 5, "regenerative": 5, "agroecolog": 5, "climate-smart": 4,
-    "climate smart": 4, "soil health": 4, "smallholder": 4,
-    # adjacent — medium weight
-    "agriculture": 3, "livestock": 3, "food system": 3, "food security": 3,
-    "rural": 2, "farmer": 3, "horticulture": 3, "nutrition": 2,
-    "climate adaptation": 4, "climate resilience": 4, "gender": 2,
-    "women": 2, "sindh": 4, "punjab": 3, "balochistan": 3, "khyber": 3,
-    # funding signals — strong signal this is biddable
-    "tender": 3, "consultancy": 3, "consultant": 3, "proposal": 2,
-    "grant": 2, "call for": 3, "procurement": 3, "expression of interest": 4,
-    "eoi": 3, "rfp": 3, "terms of reference": 3, "tor": 2,
+# ---------------------------------------------------------------------------
+# Scoring: two-tier
+#   FUNDING_SIGNALS — must have at least one, or the listing is dropped
+#   CONTEXT_KEYWORDS — boost the score for PNARD-relevant topics
+# ---------------------------------------------------------------------------
+
+FUNDING_SIGNALS = {
+    "call for proposal": 10, "call for proposals": 10,
+    "call for application": 10, "call for applications": 10,
+    "call for expression": 10, "expression of interest": 10, "eoi": 8,
+    "request for proposal": 10, "rfp": 8,
+    "request for quotation": 8, "rfq": 6,
+    "invitation to bid": 10, "invitation to tender": 10,
+    "terms of reference": 8, "tor ": 5,
+    "tender notice": 10, "tender for": 8,
+    "procurement notice": 8, "procurement of": 6,
+    "consultancy": 7, "consultant": 5,
+    "call for consultant": 10,
+    "apply by": 6, "deadline for": 5, "closing date": 5,
+    "seeking proposals": 10, "proposals are invited": 10,
+    "hiring": 4, "recruiting": 4,
+    "grant opportunity": 8, "funding opportunity": 8,
+    "scholarship": 3, "fellowship": 4,
 }
 
-MIN_SCORE = 6  # tuned on April 2026 data — gets ~15-25% of listings through
+CONTEXT_KEYWORDS = {
+    "pakistan": 5, "regenerative": 5, "agroecolog": 5, "climate-smart": 4,
+    "climate smart": 4, "soil health": 4, "smallholder": 4,
+    "agriculture": 3, "agricultural": 3, "livestock": 3, "food system": 3,
+    "food security": 3, "rural": 2, "farmer": 3, "horticulture": 3,
+    "nutrition": 2, "climate adaptation": 4, "climate resilience": 4,
+    "gender": 2, "women": 2,
+    "sindh": 4, "punjab": 3, "balochistan": 3, "khyber": 3, "pakhtunkhwa": 3,
+}
+
+MIN_SCORE = 10
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 
-def load_seen() -> set[str]:
+# ---------------------------------------------------------------------------
+# Deadline parsing
+# ---------------------------------------------------------------------------
+
+MONTHS = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+DEADLINE_CUES = re.compile(
+    r"(deadline|apply\s*by|applications?\s*close|closing\s*date|"
+    r"submission\s*deadline|due\s*(?:by|date)|expires?|last\s*date|"
+    r"no\s*later\s*than|before)\b[:\s]*",
+    re.I,
+)
+
+DATE_PATTERNS = [
+    re.compile(r"(\d{1,2})[\s\-/]+(jan|january|feb|february|mar|march|apr|april|may|"
+               r"jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
+               r"nov|november|dec|december)[\s\-/,]+(\d{4})", re.I),
+    re.compile(r"(jan|january|feb|february|mar|march|apr|april|may|"
+               r"jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
+               r"nov|november|dec|december)[\s\-/]+(\d{1,2})[\s\-/,]+(\d{4})", re.I),
+    re.compile(r"(\d{4})[\-/](\d{1,2})[\-/](\d{1,2})"),
+    re.compile(r"(\d{1,2})[\-/](\d{1,2})[\-/](\d{4})"),
+]
+
+
+def parse_deadline(text: str):
+    if not text:
+        return None
+    candidates = []
+    for m in DEADLINE_CUES.finditer(text):
+        window = text[m.end(): m.end() + 80]
+        for pat in DATE_PATTERNS:
+            dm = pat.search(window)
+            if not dm:
+                continue
+            parsed = _date_from_match(dm, pat)
+            if parsed:
+                candidates.append(parsed)
+                break
+    if not candidates:
+        return None
+    today = date.today()
+    future = [d for d in candidates if d >= today]
+    return min(future) if future else max(candidates)
+
+
+def _date_from_match(m, pat):
+    groups = m.groups()
+    try:
+        if pat is DATE_PATTERNS[0]:
+            day = int(groups[0]); month = MONTHS[groups[1].lower()]; year = int(groups[2])
+        elif pat is DATE_PATTERNS[1]:
+            month = MONTHS[groups[0].lower()]; day = int(groups[1]); year = int(groups[2])
+        elif pat is DATE_PATTERNS[2]:
+            year = int(groups[0]); month = int(groups[1]); day = int(groups[2])
+        else:
+            day = int(groups[0]); month = int(groups[1]); year = int(groups[2])
+        if not (1 <= month <= 12 and 1 <= day <= 31 and 2020 <= year <= 2035):
+            return None
+        return date(year, month, day)
+    except (ValueError, KeyError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+def load_seen():
     if not SEEN_FILE.exists():
         return set()
     try:
@@ -45,7 +144,6 @@ def load_seen() -> set[str]:
             data = json.load(f)
         if isinstance(data, list):
             return set(data)
-        # Back-compat: tolerate if someone saved it as a dict
         if isinstance(data, dict):
             return set(data.keys())
         return set()
@@ -54,9 +152,7 @@ def load_seen() -> set[str]:
         return set()
 
 
-def save_seen(seen: set[str]) -> None:
-    """Atomic write: write to temp file then rename. Prevents corruption if the
-    process is killed mid-write (which was the old bug's failure mode)."""
+def save_seen(seen):
     tmp = SEEN_FILE.with_suffix(".json.tmp")
     try:
         with tmp.open("w", encoding="utf-8") as f:
@@ -68,24 +164,49 @@ def save_seen(seen: set[str]) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def score_listing(listing: dict) -> int:
+# ---------------------------------------------------------------------------
+# Scoring + filtering
+# ---------------------------------------------------------------------------
+
+def score_listing(listing):
     text = f"{listing.get('title','')} {listing.get('summary','')}".lower()
-    return sum(weight for kw, weight in KEYWORDS.items() if kw in text)
+    funding_score = sum(w for kw, w in FUNDING_SIGNALS.items() if kw in text)
+    if funding_score == 0:
+        return 0
+    context_score = sum(w for kw, w in CONTEXT_KEYWORDS.items() if kw in text)
+    return funding_score + context_score
 
 
-def format_message(listing: dict, score: int) -> str:
+def is_expired(listing):
+    text = f"{listing.get('title','')} {listing.get('summary','')}"
+    deadline = parse_deadline(text)
+    if deadline is None:
+        return False
+    return deadline < date.today()
+
+
+# ---------------------------------------------------------------------------
+# Telegram
+# ---------------------------------------------------------------------------
+
+def format_message(listing, score):
     title = listing.get("title", "Untitled").strip()
     source = listing.get("source", "?")
     url = listing.get("url", "")
-    date = listing.get("date", "")
+    date_str = listing.get("date", "")
     summary = (listing.get("summary") or "").strip()
     if len(summary) > 300:
         summary = summary[:297] + "…"
 
+    deadline = parse_deadline(f"{title} {summary}")
+    deadline_line = f"⏰ Deadline: {deadline.isoformat()}" if deadline else ""
+
     lines = [
         f"🎯 {title}",
-        f"{source} · score {score}" + (f" · {date}" if date else ""),
+        f"{source} · score {score}" + (f" · {date_str}" if date_str else ""),
     ]
+    if deadline_line:
+        lines.append(deadline_line)
     if summary:
         lines.append("")
         lines.append(summary)
@@ -95,15 +216,7 @@ def format_message(listing: dict, score: int) -> str:
     return "\n".join(lines)
 
 
-def _escape_md(text: str) -> str:
-    # Telegram MarkdownV2 escapes — covers the characters that actually show up
-    # in tender titles and RSS summaries.
-    for ch in r"_*[]()~`>#+-=|{}.!":
-        text = text.replace(ch, "\\" + ch)
-    return text
-
-
-def send_telegram(message: str) -> bool:
+def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -126,11 +239,15 @@ def send_telegram(message: str) -> bool:
         return False
 
 
-def main() -> int:
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
     seen = load_seen()
     print(f"[seen] loaded {len(seen)} known listing IDs")
 
-    all_listings: list[dict] = []
+    all_listings = []
     for name, scraper in [
         ("ReliefWeb", scrape_reliefweb),
         ("ADB", scrape_adb),
@@ -141,12 +258,18 @@ def main() -> int:
             print(f"[{name}] {len(got)} listings")
             all_listings.extend(got)
         except Exception as e:
-            # One broken scraper should never take down the whole run.
             print(f"[{name}] FAILED: {e}", file=sys.stderr)
 
-    # Filter to new + above score threshold
-    new_matches: list[tuple[dict, int]] = []
-    new_ids: set[str] = set()
+    new_matches = []
+    new_ids = set()
+    dropped_expired = 0
+    dropped_no_funding = 0
+
+    # Sources like "World Bank" are project records, not open calls. We track
+    # them in seen.json but never alert on them — they're pipeline intel you
+    # can check manually, not things to bid on today.
+    NON_ALERTING_SOURCES = {"World Bank"}
+
     for listing in all_listings:
         lid = listing.get("id")
         if not lid:
@@ -154,18 +277,24 @@ def main() -> int:
         new_ids.add(lid)
         if lid in seen:
             continue
+        if listing.get("source") in NON_ALERTING_SOURCES:
+            continue
         score = score_listing(listing)
-        if score >= MIN_SCORE:
-            new_matches.append((listing, score))
+        if score == 0:
+            dropped_no_funding += 1
+            continue
+        if score < MIN_SCORE:
+            continue
+        if is_expired(listing):
+            dropped_expired += 1
+            continue
+        new_matches.append((listing, score))
 
     new_matches.sort(key=lambda x: x[1], reverse=True)
+    print(f"[filter] dropped {dropped_no_funding} (no funding signal), "
+          f"{dropped_expired} (expired deadline)")
     print(f"[match] {len(new_matches)} new listings above score {MIN_SCORE}")
 
-    # BUG FIX: persist seen BEFORE attempting Telegram delivery.
-    # Old behaviour: save happened after successful send, so dry-runs (no token)
-    # and failed sends caused the same listings to get re-matched next run.
-    # New behaviour: once we've decided a listing is "seen", that decision is
-    # committed to disk immediately. Delivery is best-effort.
     seen.update(new_ids)
     save_seen(seen)
     print(f"[seen] saved {len(seen)} IDs")
@@ -181,11 +310,7 @@ def main() -> int:
         msg = format_message(listing, score)
         if send_telegram(msg):
             sent += 1
-            time.sleep(1.2)  # Telegram rate limit is ~30 msg/sec but be kind
-        else:
-            # Don't re-queue — listing is already in seen.json. Better to miss
-            # one alert than to spam on every retry.
-            pass
+            time.sleep(1.2)
     print(f"[telegram] sent {sent}/{len(new_matches)}")
     return 0
 
