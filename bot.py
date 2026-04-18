@@ -18,6 +18,7 @@ import requests
 from scrapers.reliefweb import scrape_reliefweb
 from scrapers.adb import scrape_adb
 from scrapers.worldbank import scrape_worldbank
+from scrapers.undp import scrape_undp
 
 ROOT = Path(__file__).parent
 SEEN_FILE = ROOT / "seen.json"
@@ -32,15 +33,18 @@ FUNDING_SIGNALS = {
     "call for proposal": 10, "call for proposals": 10,
     "call for application": 10, "call for applications": 10,
     "call for expression": 10, "expression of interest": 10, "eoi": 8,
-    "request for proposal": 10, "rfp": 8,
-    "request for quotation": 8, "rfq": 6,
+    "request for proposal": 10, "rfp": 8, "rfp-": 8, "-rfp": 8,
+    "request for quotation": 8, "rfq": 6, "rfq-": 8, "-rfq": 8,
     "invitation to bid": 10, "invitation to tender": 10,
+    "itb-": 8, "-itb-": 8,
+    "ic-20": 7,   # UNDP individual contractor code (IC-2026-XXX)
     "terms of reference": 8, "tor ": 5,
     "tender notice": 10, "tender for": 8,
     "procurement notice": 8, "procurement of": 6,
     "consultancy": 7, "consultant": 5,
     "call for consultant": 10,
-    "apply by": 6, "deadline for": 5, "closing date": 5,
+    "apply by": 6, "application deadline": 8,
+    "deadline for": 5, "closing date": 5,
     "seeking proposals": 10, "proposals are invited": 10,
     "hiring": 4, "recruiting": 4,
     "grant opportunity": 8, "funding opportunity": 8,
@@ -58,6 +62,29 @@ CONTEXT_KEYWORDS = {
 }
 
 MIN_SCORE = 10
+
+# Topics PNARD does not bid on. If any of these terms dominate the title,
+# the listing is dropped even if it has funding signals.
+IRRELEVANT_PATTERNS = [
+    # Physical supply/procurement, not consulting work
+    re.compile(r"\bsupply\s+(?:and\s+)?(?:installation|delivery|of)\b", re.I),
+    re.compile(r"\bprocurement\s+and\s+supply\b", re.I),
+    re.compile(r"\b(?:beautician|cosmetic|fashion|abaya|jewellery|sport|tool)\s+kits?\b", re.I),
+    re.compile(r"\bconstruction\b.{0,30}\b(?:boreholes?|water\s+tower|housing|office|building)\b", re.I),
+    re.compile(r"\b(?:catering|conference)\s+services?\b", re.I),
+    re.compile(r"\bserver\s+equipment\b", re.I),
+    re.compile(r"\b(?:stationery|vehicles?|fuel|uniforms?)\b", re.I),
+    # Clearly off-country positions that still mention Pakistan somewhere
+    re.compile(r"\b(?:afghanistan|iraq|syria|yemen|sudan|myanmar|ukraine)\s+(?:country\s+)?director\b", re.I),
+]
+
+# Countries that frequently appear in regional postings but aren't PNARD's scope.
+# A listing is dropped if its title names one of these WITHOUT also naming Pakistan.
+OFF_COUNTRY_IF_NO_PAKISTAN = re.compile(
+    r"\b(afghanistan|iraq|syria|yemen|sudan|myanmar|ukraine|lebanon|somalia|"
+    r"ethiopia|dr\s+congo|palestine|gaza|venezuela|haiti)\b", re.I,
+)
+PAKISTAN_MENTION = re.compile(r"\bpakistan\b", re.I)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -82,14 +109,20 @@ DEADLINE_CUES = re.compile(
 )
 
 DATE_PATTERNS = [
+    # "30 April 2026" / "30 Apr 2026" / "30-April-2026"
     re.compile(r"(\d{1,2})[\s\-/]+(jan|january|feb|february|mar|march|apr|april|may|"
                r"jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
                r"nov|november|dec|december)[\s\-/,]+(\d{4})", re.I),
+    # "April 30, 2026" / "April 30 2026"
     re.compile(r"(jan|january|feb|february|mar|march|apr|april|may|"
                r"jun|june|jul|july|aug|august|sep|sept|september|oct|october|"
                r"nov|november|dec|december)[\s\-/]+(\d{1,2})[\s\-/,]+(\d{4})", re.I),
+    # "2026-04-30" / "2026/04/30"
     re.compile(r"(\d{4})[\-/](\d{1,2})[\-/](\d{1,2})"),
+    # "30/04/2026" / "30-04-2026"
     re.compile(r"(\d{1,2})[\-/](\d{1,2})[\-/](\d{4})"),
+    # "05-Jan-26" / "30-Apr-26" — UNDP's format, 2-digit year
+    re.compile(r"(\d{1,2})[\s\-/]+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[\s\-/,]+(\d{2})(?!\d)", re.I),
 ]
 
 
@@ -123,8 +156,13 @@ def _date_from_match(m, pat):
             month = MONTHS[groups[0].lower()]; day = int(groups[1]); year = int(groups[2])
         elif pat is DATE_PATTERNS[2]:
             year = int(groups[0]); month = int(groups[1]); day = int(groups[2])
-        else:
+        elif pat is DATE_PATTERNS[3]:
             day = int(groups[0]); month = int(groups[1]); year = int(groups[2])
+        else:  # DATE_PATTERNS[4] — 2-digit year, assume 20xx
+            day = int(groups[0]); month = MONTHS[groups[1].lower()]
+            yy = int(groups[2])
+            # Rough heuristic: 00-50 -> 2000-2050, 51-99 -> 1951-1999
+            year = 2000 + yy if yy <= 50 else 1900 + yy
         if not (1 <= month <= 12 and 1 <= day <= 31 and 2020 <= year <= 2035):
             return None
         return date(year, month, day)
@@ -183,6 +221,19 @@ def is_expired(listing):
     if deadline is None:
         return False
     return deadline < date.today()
+
+
+def is_irrelevant(listing) -> bool:
+    """True if the listing is obviously not PNARD work (physical procurement,
+    off-country jobs, etc.)"""
+    title = listing.get("title", "")
+    for pat in IRRELEVANT_PATTERNS:
+        if pat.search(title):
+            return True
+    # Off-country posting that doesn't also mention Pakistan
+    if OFF_COUNTRY_IF_NO_PAKISTAN.search(title) and not PAKISTAN_MENTION.search(title):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +303,7 @@ def main():
         ("ReliefWeb", scrape_reliefweb),
         ("ADB", scrape_adb),
         ("World Bank", scrape_worldbank),
+        ("UNDP", scrape_undp),
     ]:
         try:
             got = scraper()
@@ -264,6 +316,7 @@ def main():
     new_ids = set()
     dropped_expired = 0
     dropped_no_funding = 0
+    dropped_irrelevant = 0
 
     # Sources like "World Bank" are project records, not open calls. We track
     # them in seen.json but never alert on them — they're pipeline intel you
@@ -279,6 +332,9 @@ def main():
             continue
         if listing.get("source") in NON_ALERTING_SOURCES:
             continue
+        if is_irrelevant(listing):
+            dropped_irrelevant += 1
+            continue
         score = score_listing(listing)
         if score == 0:
             dropped_no_funding += 1
@@ -292,6 +348,7 @@ def main():
 
     new_matches.sort(key=lambda x: x[1], reverse=True)
     print(f"[filter] dropped {dropped_no_funding} (no funding signal), "
+          f"{dropped_irrelevant} (irrelevant), "
           f"{dropped_expired} (expired deadline)")
     print(f"[match] {len(new_matches)} new listings above score {MIN_SCORE}")
 
